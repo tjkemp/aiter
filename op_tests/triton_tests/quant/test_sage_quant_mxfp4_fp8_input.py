@@ -140,15 +140,15 @@ def test_sage_quant_mxfp4_fp8_input_vs_upcast(B, S, H, D, layout, v_fp8):
 
 
 @pytest.mark.parametrize("layout", ["bshd", "bhsd"])
-@pytest.mark.parametrize("v_fp8", [False, True])
 @pytest.mark.parametrize("B, S, H, D", [
     (1, 256, 8, 128),
     (1, 1024, 16, 128),
 ])
-def test_sage_quant_mxfp4_fp8_input_vs_bf16_ref(B, S, H, D, layout, v_fp8):
+def test_sage_quant_mxfp4_fp8_input_vs_bf16_ref(B, S, H, D, layout):
     """fp8 fused path must stay above a minimum cosine similarity vs bf16 reference.
-    Parametrized over v_fp8 to cover both the bf16-V and fp8-V passthrough paths.
-    Q/K correctness is identical in both cases since V doesn't affect Q/K quantization.
+    V dtype is not parametrized here because V does not affect Q/K quantization —
+    the fp8-V passthrough path is already covered by test_sage_quant_mxfp4_fp8_input_vs_upcast
+    and test_sage_quant_mxfp4_fp8_input_attention.
     """
     if not arch_info.is_fp4_avail():
         pytest.skip("MXFP4 not supported on this architecture")
@@ -165,12 +165,9 @@ def test_sage_quant_mxfp4_fp8_input_vs_bf16_ref(B, S, H, D, layout, v_fp8):
     kw = _quant_kwargs(layout, R)
 
     ref = sage_quant_mxfp4(q_bf16, k_bf16, v_bf16, **kw)
-    ref_q_fp4, ref_q_sc, ref_k_fp4, ref_k_sc, ref_v_fp8, ref_v_sc, _ = ref
+    ref_q_fp4, ref_q_sc, ref_k_fp4, ref_k_sc, _, _, _ = ref
 
-    if v_fp8:
-        out = sage_quant_mxfp4_fp8_input(q_fp8, k_fp8, ref_v_fp8, **kw, v_scale=ref_v_sc)
-    else:
-        out = sage_quant_mxfp4_fp8_input(q_fp8, k_fp8, v_bf16, **kw)
+    out = sage_quant_mxfp4_fp8_input(q_fp8, k_fp8, v_bf16, **kw)
     out_q_fp4, out_q_sc, out_k_fp4, out_k_sc, _, _, _ = out
 
     q_cos = _cosine_sim(_dequant(out_q_fp4, out_q_sc), _dequant(ref_q_fp4, ref_q_sc))
