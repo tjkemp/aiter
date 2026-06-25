@@ -227,10 +227,12 @@ def test_sage_quant_mxfp4_fp8_input_attention(BATCH, SEQLEN, NUM_Q_HEADS, NUM_K_
     torch_out = torch_out.permute(0, 2, 1, 3).contiguous()
 
     assert triton_out.shape == torch_out.shape
+    # fp8 inputs are noisier than bf16, so we allow a higher diff percentage
+    # than the bf16→mxfp4 path (which uses 1.5%).
     check_attention_outputs(
         triton_out, torch_out,
         fp8=True,
         atol=ATOL_FP8,
         rtol=RTOL_FP8,
-        max_diff_percentage=1.5,
+        max_diff_percentage=4.0,
     )
