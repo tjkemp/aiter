@@ -78,6 +78,7 @@ def _quant_kwargs(layout, R):
 # Unit tests: quantized-output correctness
 # ---------------------------------------------------------------------------
 
+@pytest.mark.parametrize("v_fp8", [False, True])
 @pytest.mark.parametrize("layout", ["bshd", "bhsd"])
 @pytest.mark.parametrize("B, S, H, D", [
     (1, 256, 8, 128),
@@ -85,7 +86,7 @@ def _quant_kwargs(layout, R):
     (2, 512, 16, 128),
     (4, 256, 16, 128),
 ])
-def test_sage_quant_mxfp4_fp8_input_vs_upcast(B, S, H, D, layout):
+def test_sage_quant_mxfp4_fp8_input_vs_upcast(B, S, H, D, layout, v_fp8):
     """Fused fp8 kernel must agree with the upcast path on identical fp8 inputs."""
     if not arch_info.is_fp4_avail():
         pytest.skip("MXFP4 not supported on this architecture")
@@ -105,8 +106,12 @@ def test_sage_quant_mxfp4_fp8_input_vs_upcast(B, S, H, D, layout):
     ref = sage_quant_mxfp4(q_fp8.to(torch.bfloat16), k_fp8.to(torch.bfloat16), v_bf16, **kw)
     ref_q_fp4, ref_q_sc, ref_k_fp4, ref_k_sc, ref_v_fp8, ref_v_sc, _ = ref
 
-    # Candidate: fused on-chip widening
-    out = sage_quant_mxfp4_fp8_input(q_fp8, k_fp8, v_bf16, **kw)
+    # Candidate: fused on-chip widening, with optional pre-quantized fp8 V
+    if v_fp8:
+        # Simulate upstream-quantized V: use ref v_fp8/v_sc as the pre-quantized input
+        out = sage_quant_mxfp4_fp8_input(q_fp8, k_fp8, ref_v_fp8, **kw, v_scale=ref_v_sc)
+    else:
+        out = sage_quant_mxfp4_fp8_input(q_fp8, k_fp8, v_bf16, **kw)
     out_q_fp4, out_q_sc, out_k_fp4, out_k_sc, out_v_fp8, out_v_sc, _ = out
 
     q_dq = _dequant(out_q_fp4, out_q_sc)
@@ -123,20 +128,28 @@ def test_sage_quant_mxfp4_fp8_input_vs_upcast(B, S, H, D, layout):
     assert _sign_agree(k_dq, rk_dq) >= SIGN_AGREE_THRESHOLD, \
         f"K sign agreement too low: {_sign_agree(k_dq, rk_dq):.4f}"
 
-    # V must be bit-identical — same bf16 input, same code path
+    # V checks: fp8 passthrough must be bit-identical; bf16 path must be near-identical
     v_dq = out_v_fp8.to(torch.float32) * out_v_sc.unsqueeze(1 if layout == "bshd" else 2)
     rv_dq = ref_v_fp8.to(torch.float32) * ref_v_sc.unsqueeze(1 if layout == "bshd" else 2)
-    assert _cosine_sim(v_dq, rv_dq) >= V_COS_THRESHOLD, \
-        f"V cosine similarity too low: {_cosine_sim(v_dq, rv_dq):.4f}"
+    if v_fp8:
+        assert torch.equal(out_v_fp8, ref_v_fp8), "V fp8 passthrough must be bit-identical"
+        assert torch.equal(out_v_sc, ref_v_sc), "V scale fp8 passthrough must be bit-identical"
+    else:
+        assert _cosine_sim(v_dq, rv_dq) >= V_COS_THRESHOLD, \
+            f"V cosine similarity too low: {_cosine_sim(v_dq, rv_dq):.4f}"
 
 
 @pytest.mark.parametrize("layout", ["bshd", "bhsd"])
+@pytest.mark.parametrize("v_fp8", [False, True])
 @pytest.mark.parametrize("B, S, H, D", [
     (1, 256, 8, 128),
     (1, 1024, 16, 128),
 ])
-def test_sage_quant_mxfp4_fp8_input_vs_bf16_ref(B, S, H, D, layout):
-    """fp8 fused path must stay above a minimum cosine similarity vs bf16 reference."""
+def test_sage_quant_mxfp4_fp8_input_vs_bf16_ref(B, S, H, D, layout, v_fp8):
+    """fp8 fused path must stay above a minimum cosine similarity vs bf16 reference.
+    Parametrized over v_fp8 to cover both the bf16-V and fp8-V passthrough paths.
+    Q/K correctness is identical in both cases since V doesn't affect Q/K quantization.
+    """
     if not arch_info.is_fp4_avail():
         pytest.skip("MXFP4 not supported on this architecture")
 
@@ -152,9 +165,12 @@ def test_sage_quant_mxfp4_fp8_input_vs_bf16_ref(B, S, H, D, layout):
     kw = _quant_kwargs(layout, R)
 
     ref = sage_quant_mxfp4(q_bf16, k_bf16, v_bf16, **kw)
-    ref_q_fp4, ref_q_sc, ref_k_fp4, ref_k_sc, _, _, _ = ref
+    ref_q_fp4, ref_q_sc, ref_k_fp4, ref_k_sc, ref_v_fp8, ref_v_sc, _ = ref
 
-    out = sage_quant_mxfp4_fp8_input(q_fp8, k_fp8, v_bf16, **kw)
+    if v_fp8:
+        out = sage_quant_mxfp4_fp8_input(q_fp8, k_fp8, ref_v_fp8, **kw, v_scale=ref_v_sc)
+    else:
+        out = sage_quant_mxfp4_fp8_input(q_fp8, k_fp8, v_bf16, **kw)
     out_q_fp4, out_q_sc, out_k_fp4, out_k_sc, _, _, _ = out
 
     q_cos = _cosine_sim(_dequant(out_q_fp4, out_q_sc), _dequant(ref_q_fp4, ref_q_sc))
@@ -169,14 +185,16 @@ def test_sage_quant_mxfp4_fp8_input_vs_bf16_ref(B, S, H, D, layout):
 # End-to-end attention test
 # ---------------------------------------------------------------------------
 
+@pytest.mark.parametrize("v_fp8", [False, True])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(16, 16), (16, 8)])
 @pytest.mark.parametrize("BATCH, SEQLEN", [(1, 256), (2, 256), (4, 128)])
-def test_sage_quant_mxfp4_fp8_input_attention(BATCH, SEQLEN, NUM_Q_HEADS, NUM_K_HEADS, causal):
+def test_sage_quant_mxfp4_fp8_input_attention(BATCH, SEQLEN, NUM_Q_HEADS, NUM_K_HEADS, causal, v_fp8):
     """
     Full attention pass using fp8 q/k through sage_quant_mxfp4_fp8_input,
     compared against PyTorch reference attention with the same tolerances as
-    test_sage_mxfp4.
+    test_sage_mxfp4. Parametrized over v_fp8 to cover both the bf16-V
+    quantization path and the fp8-V passthrough path.
     """
     if not arch_info.is_fp4_avail():
         pytest.skip("MXFP4 not supported on this architecture")
@@ -196,10 +214,19 @@ def test_sage_quant_mxfp4_fp8_input_attention(BATCH, SEQLEN, NUM_Q_HEADS, NUM_K_
     R = create_hadamard_matrix(128, device="cuda", dtype=torch.bfloat16) / (128 ** 0.5)
     kw = _quant_kwargs(layout, R)
 
-    # Quantize via our fp8 fused path
-    q_fp4, q_sc, k_fp4, k_sc, v_fp8, v_sc, _ = sage_quant_mxfp4_fp8_input(
-        q_fp8, k_fp8, v_bf16, **kw
-    )
+    if v_fp8:
+        # Pre-quantize V using the bf16 path to get a realistic fp8 V + scale,
+        # then pass them directly to exercise the passthrough branch.
+        _, _, _, _, v_in, v_scale_in, _ = sage_quant_mxfp4_fp8_input(
+            q_fp8, k_fp8, v_bf16, **kw
+        )
+        q_fp4, q_sc, k_fp4, k_sc, v_out, v_sc, _ = sage_quant_mxfp4_fp8_input(
+            q_fp8, k_fp8, v_in, **kw, v_scale=v_scale_in
+        )
+    else:
+        q_fp4, q_sc, k_fp4, k_sc, v_out, v_sc, _ = sage_quant_mxfp4_fp8_input(
+            q_fp8, k_fp8, v_bf16, **kw
+        )
 
     # Run the mxfp4 attention kernel with our quantized tensors.
     # fav3_sage_mxfp4_func signature: (q, k, v, q_descale, k_descale, v_descale, ...)
@@ -210,7 +237,7 @@ def test_sage_quant_mxfp4_fp8_input_attention(BATCH, SEQLEN, NUM_Q_HEADS, NUM_K_
 
     config = get_sage_fwd_configs_mxfp4()
     triton_out = fav3_sage_mxfp4_func(
-        q_fp4, k_fp4, v_fp8,
+        q_fp4, k_fp4, v_out,
         q_descale=q_sc,
         k_descale=k_sc,
         v_descale=v_sc,

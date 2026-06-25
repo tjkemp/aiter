@@ -2,14 +2,16 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #
 # sage_quant_mxfp4_fp8_input: same contract as sage_quant_mxfp4 but accepts
-# fp8 q and k tensors. The fp8->fp32 widening happens inside the Triton
-# kernels on the first tl.load, so no intermediate bf16 tensor is written to
-# HBM.
+# fp8 q, k, and optionally fp8 v tensors. The fp8->fp32 widening happens
+# inside the Triton kernels on the first tl.load, so no intermediate bf16
+# tensor is written to HBM.
 #
-# v stays bf16 — it is quantized to fp8 by sage_quant_v_kernel as usual.
+# If v is fp8, v_scale must be provided (computed when v was quantized upstream)
+# and sage_quant_v_kernel is skipped entirely — v passes through unchanged.
+# If v is bf16/fp16, v_scale must be None and the existing quantization path runs.
+#
 # k-smoothing (subtract k.mean) cannot be done in fp8 on the host, so the
-# mean is computed in fp32 and subtracted inside the kernel (smooth_k=True
-# case defers the subtraction to the Triton kernel via a pre-computed k_mean).
+# mean is computed in fp32 and subtracted inside the kernel.
 
 import torch
 import triton
@@ -21,6 +23,9 @@ from aiter.ops.triton._triton_kernels.quant.sage_attention_quant_fp8_input impor
     _rotate_quantize_qk_fp8_kernel,
 )
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import create_hadamard_matrix
+
+
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
 
 
 def sage_quant_mxfp4_fp8_input(
@@ -36,29 +41,36 @@ def sage_quant_mxfp4_fp8_input(
     layout="bshd",
     R=None,
     BLOCK_R=128,
+    v_scale=None,
 ):
     """
-    Quantize fp8 q/k and bf16 v for mxfp4 sage attention.
+    Quantize fp8 q/k and bf16-or-fp8 v for mxfp4 sage attention.
 
     q, k must be fp8 (float8_e4m3fn or float8_e4m3fnuz).
-    v must be bf16 or fp16.
+    v can be:
+      - bf16 or fp16: quantized to fp8 internally; v_scale must be None.
+      - fp8: passed through unchanged; v_scale must be provided. It must
+        be the scale that was used when V was originally quantized, i.e.
+        v_bf16.abs().amax(dim=seq) / FP8_MAX, shape [B, H, D] fp32.
+        Passing the wrong scale produces systematically wrong output
+        magnitudes that propagate directly into the attention result.
 
     Returns: q_fp4, q_scale, k_fp4, k_scale, v_fp8, v_scale, delta_s
       - q_fp4, k_fp4 : uint8 packed e2m1 fp4
       - q_scale, k_scale : uint8 e8m0 block scales  [*, D/32]
-      - v_fp8  : fp8 quantized v
+      - v_fp8  : fp8 v (quantized here if input was bf16, else passed through)
       - v_scale: fp32 per-(B,H,D) scale
       - delta_s: None (q_smoothing not yet supported for fp8 input path)
     """
-    assert q.dtype in (
-        torch.float8_e4m3fn,
-        torch.float8_e4m3fnuz,
-    ), f"q must be fp8, got {q.dtype}"
-    assert k.dtype in (
-        torch.float8_e4m3fn,
-        torch.float8_e4m3fnuz,
-    ), f"k must be fp8, got {k.dtype}"
+    assert q.dtype in _FP8_DTYPES, f"q must be fp8, got {q.dtype}"
+    assert k.dtype in _FP8_DTYPES, f"k must be fp8, got {k.dtype}"
     assert not q_smoothing, "q_smoothing is not supported for fp8 input"
+
+    v_is_fp8 = v.dtype in _FP8_DTYPES
+    if v_is_fp8:
+        assert v_scale is not None, "v_scale must be provided when v is fp8"
+    else:
+        assert v_scale is None, "v_scale must be None when v is bf16/fp16 (computed internally)"
 
     bshd_map = [0, 1, 2, 3] if layout == "bshd" else [0, 2, 1, 3]
     b, s_q, h_q, d = map_dims(q.shape, bshd_map)
@@ -124,34 +136,38 @@ def sage_quant_mxfp4_fp8_input(
         num_stages=5,
     )
 
-    # V quantization (unchanged — v is already bf16)
-    # sage_quant_v_kernel expects strides in (B, H, S, D) order regardless of layout,
-    # so H and S are swapped for bshd tensors (same as original sage_quant_mxfp4).
-    if layout == "bshd":
-        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
-            v.stride(0), v.stride(2), v.stride(1), v.stride(3)
-        )
+    if v_is_fp8:
+        # v is already quantized upstream — pass through, skip kernel launch.
+        v_fp8 = v
     else:
-        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3)
-        )
-    v_fp8 = torch.empty_like(v, dtype=FP8_TYPE)
-    v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
+        # Quantize bf16/fp16 v to fp8.
+        # sage_quant_v_kernel expects strides in (B, H, S, D) order regardless of
+        # layout, so H and S are swapped for bshd tensors.
+        if layout == "bshd":
+            stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
+                v.stride(0), v.stride(2), v.stride(1), v.stride(3)
+            )
+        else:
+            stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
+                v.stride(0), v.stride(1), v.stride(2), v.stride(3)
+            )
+        v_fp8 = torch.empty_like(v, dtype=FP8_TYPE)
+        v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
 
-    v_task_count = b * h_k * K_NUM_BLKS
-    sage_quant_v_kernel[(v_task_count,)](
-        v,
-        v_fp8,
-        v_scale,
-        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v,
-        v_scale.stride(0), v_scale.stride(1),
-        b, h_k,
-        K_NUM_BLKS,
-        s_k,
-        D=d,
-        BLK_K=BLKK,
-        num_stages=3,
-        num_warps=8,
-    )
+        v_task_count = b * h_k * K_NUM_BLKS
+        sage_quant_v_kernel[(v_task_count,)](
+            v,
+            v_fp8,
+            v_scale,
+            stride_bz_v, stride_h_v, stride_seq_v, stride_d_v,
+            v_scale.stride(0), v_scale.stride(1),
+            b, h_k,
+            K_NUM_BLKS,
+            s_k,
+            D=d,
+            BLK_K=BLKK,
+            num_stages=3,
+            num_warps=8,
+        )
 
     return Q_q, Q_descale, K_q, K_descale, v_fp8, v_scale, None
