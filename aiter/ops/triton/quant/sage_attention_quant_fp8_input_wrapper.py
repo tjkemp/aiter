@@ -18,8 +18,7 @@ from aiter.ops.triton._triton_kernels.quant.sage_attention_quant import (
     sage_quant_v_kernel,
 )
 from aiter.ops.triton._triton_kernels.quant.sage_attention_quant_fp8_input import (
-    _rotate_quantize_q_fp8_kernel,
-    _rotate_quantize_k_fp8_kernel,
+    _rotate_quantize_qk_fp8_kernel,
 )
 from aiter.ops.triton.quant.sage_attention_quant_wrappers import create_hadamard_matrix
 
@@ -95,46 +94,30 @@ def sage_quant_mxfp4_fp8_input(
     stride_qsb, stride_qsm, stride_qsh, stride_qsd = map_dims(Q_descale.stride(), bshd_map)
     stride_ksb, stride_ksn, stride_ksh, stride_ksd = map_dims(K_descale.stride(), bshd_map)
 
-    # Q kernel
-    grid_q = (b * h_q * Q_NUM_BLKS,)
-    _rotate_quantize_q_fp8_kernel[grid_q](
+    # Single fused kernel handles all Q and K blocks concurrently.
+    # Both Q and K use BLKQ as the rotation block size (same as original sage_quant_mxfp4).
+    # BLKK is only used for the V kernel below.
+    K_ROT_NUM_BLKS = (s_k + BLKQ - 1) // BLKQ
+    total_pids = b * h_q * Q_NUM_BLKS + b * h_k * K_ROT_NUM_BLKS
+    _rotate_quantize_qk_fp8_kernel[(total_pids,)](
         q,
         Q_q,
         Q_descale,
-        None,   # Q_mean — q_smoothing disabled
-        R,
-        sm_scale * 1.4426950408889634,
-        stride_qb, stride_qh, stride_qm, stride_qd,
-        stride_qqb, stride_qqm, stride_qqh, stride_qqd,
-        stride_qsb, stride_qsm, stride_qsh, stride_qsd,
-        0, 0, 0, 0,   # mean strides (unused)
-        b, h_q, s_q, d,
-        q_smoothing=False,
-        BLOCK_M=BLKQ,
-        BLOCK_R=BLOCK_R,
-        D=d,
-        num_warps=4,
-        num_stages=5,
-    )
-
-    # K kernel: loads fp8 K, subtracts k_mean on-chip, rotates, quantizes to fp4.
-    # k_mean is [B, H, D] fp32 — tiny, so passing it as a pointer is cheap.
-    # stride_meanb, stride_meanh index into [B, H, D]; the seq dim is gone (it's
-    # the mean over seq), so stride_meand is always k_mean.stride(-1) = 1.
-    grid_k = (b * h_k * K_NUM_BLKS,)
-    _rotate_quantize_k_fp8_kernel[grid_k](
         k,
         K_q,
         K_descale,
         k_mean,
         R,
+        sm_scale * 1.4426950408889634,
+        stride_qb, stride_qh, stride_qm, stride_qd,
+        stride_qqb, stride_qqm, stride_qqh, stride_qqd,
+        stride_qsb, stride_qsm, stride_qsh, stride_qsd,
         stride_kb, stride_kh, stride_kn, stride_kd,
         stride_kqb, stride_kqn, stride_kqh, stride_kqd,
         stride_ksb, stride_ksn, stride_ksh, stride_ksd,
         k_mean.stride(0), k_mean.stride(1), k_mean.stride(2),
-        b, h_k, s_k, d,
-        smooth_k=True,
-        BLOCK_M=BLKK,
+        b, h_q, h_k, s_q, s_k, d,
+        BLOCK_M=BLKQ,
         BLOCK_R=BLOCK_R,
         D=d,
         num_warps=4,
