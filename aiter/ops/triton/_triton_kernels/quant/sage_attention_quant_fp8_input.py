@@ -124,6 +124,7 @@ def _rotate_quantize_k_fp8_kernel(
     K,               # fp8 input
     K_q,             # uint8 output (packed fp4x2)
     K_descale,       # uint8 output (e8m0 scales)
+    K_mean,          # fp32 [B, 1, H, D] or [B, H, 1, D] — per-(B,H,D) mean to subtract
     R,               # Hadamard matrix [BLOCK_R, BLOCK_R] in bf16
     stride_kb,
     stride_kh,
@@ -137,11 +138,14 @@ def _rotate_quantize_k_fp8_kernel(
     stride_ksn,
     stride_ksh,
     stride_ksd,
+    stride_meanb,
+    stride_meanh,
+    stride_meand,
     batch,
     heads_k,
     seqlen_k,
     d_model,
-    smooth_k: tl.constexpr,  # whether k-mean subtraction was already applied
+    smooth_k: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_R: tl.constexpr,
     D: tl.constexpr,
@@ -176,12 +180,23 @@ def _rotate_quantize_k_fp8_kernel(
         + offs_dq[None, :] * stride_kqd
     )
 
-    # Load fp8, widen to fp32 on-chip
+    # Load fp8, widen to fp32 on-chip — no intermediate bf16 tensor in HBM
     qk_tile = tl.load(
         qk_ptr,
         mask=(offs_m[:, None] < seqlen_k) & (offs_d[None, :] < d_model),
         other=0.0,
     ).to(tl.float32)
+
+    # Subtract per-(B,H,D) mean on-chip — K_mean is fp32, shape [B, H, D]
+    if smooth_k:
+        mean_ptr = (
+            K_mean
+            + pid_b * stride_meanb
+            + pid_h * stride_meanh
+            + offs_d[None, :] * stride_meand
+        )
+        k_mean = tl.load(mean_ptr)  # [1, D] broadcast over BLOCK_M
+        qk_tile -= k_mean
 
     r_ptr = (
         R

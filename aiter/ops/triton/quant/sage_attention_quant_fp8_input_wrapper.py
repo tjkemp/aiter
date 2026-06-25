@@ -73,16 +73,13 @@ def sage_quant_mxfp4_fp8_input(
             BLOCK_R ** 0.5
         )
 
-    # --- k smoothing: compute mean in fp32 (fp8 arithmetic unsupported on host)
-    #     and subtract before passing to the kernel.  We store the result as fp8
-    #     so the kernel still loads fp8 from HBM.
-    k_mean = k.to(torch.float32).mean(
-        dim=1 if layout == "bshd" else 2, keepdim=True
-    )
-    k_smoothed = (k.to(torch.float32) - k_mean).to(k.dtype)
+    # Compute k_mean in fp32 on the host (one read-only pass over K), then pass
+    # the small [B, H, D] mean tensor into the kernel so the subtraction happens
+    # on-chip after loading fp8 K. This avoids writing a smoothed-K tensor to HBM.
+    k_mean = k.to(torch.float32).mean(dim=1 if layout == "bshd" else 2)  # [B, H, D]
 
     stride_qb, stride_qm, stride_qh, stride_qd = map_dims(q.stride(), bshd_map)
-    stride_kb, stride_kn, stride_kh, stride_kd = map_dims(k_smoothed.stride(), bshd_map)
+    stride_kb, stride_kn, stride_kh, stride_kd = map_dims(k.stride(), bshd_map)
 
     Q_NUM_BLKS = (s_q + BLKQ - 1) // BLKQ
     K_NUM_BLKS = (s_k + BLKK - 1) // BLKK
@@ -120,18 +117,23 @@ def sage_quant_mxfp4_fp8_input(
         num_stages=5,
     )
 
-    # K kernel (receives already-smoothed k_smoothed in fp8)
+    # K kernel: loads fp8 K, subtracts k_mean on-chip, rotates, quantizes to fp4.
+    # k_mean is [B, H, D] fp32 — tiny, so passing it as a pointer is cheap.
+    # stride_meanb, stride_meanh index into [B, H, D]; the seq dim is gone (it's
+    # the mean over seq), so stride_meand is always k_mean.stride(-1) = 1.
     grid_k = (b * h_k * K_NUM_BLKS,)
     _rotate_quantize_k_fp8_kernel[grid_k](
-        k_smoothed,
+        k,
         K_q,
         K_descale,
+        k_mean,
         R,
         stride_kb, stride_kh, stride_kn, stride_kd,
         stride_kqb, stride_kqn, stride_kqh, stride_kqd,
         stride_ksb, stride_ksn, stride_ksh, stride_ksd,
+        k_mean.stride(0), k_mean.stride(1), k_mean.stride(2),
         b, h_k, s_k, d,
-        smooth_k=False,   # already subtracted above
+        smooth_k=True,
         BLOCK_M=BLKK,
         BLOCK_R=BLOCK_R,
         D=d,
