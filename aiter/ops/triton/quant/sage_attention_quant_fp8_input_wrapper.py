@@ -140,7 +140,16 @@ def sage_quant_mxfp4_fp8_input(
     )
 
     # V quantization (unchanged — v is already bf16)
-    stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = map_dims(v.stride(), bshd_map)
+    # sage_quant_v_kernel expects strides in (B, H, S, D) order regardless of layout,
+    # so H and S are swapped for bshd tensors (same as original sage_quant_mxfp4).
+    if layout == "bshd":
+        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
+            v.stride(0), v.stride(2), v.stride(1), v.stride(3)
+        )
+    else:
+        stride_bz_v, stride_h_v, stride_seq_v, stride_d_v = (
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3)
+        )
     v_fp8 = torch.empty_like(v, dtype=FP8_TYPE)
     v_scale = v.abs().amax(dim=1 if layout == "bshd" else 2).to(torch.float32) / FP8_MAX
 
